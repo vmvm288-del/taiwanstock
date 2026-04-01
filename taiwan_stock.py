@@ -9,7 +9,7 @@ from plotly.subplots import make_subplots
 st.set_page_config(page_title="台股短線全能分析助手", layout="wide")
 st.title("📈 台股短線量價診斷 + 自動掃描系統")
 
-# 2. 定義掃描名單 (0050 部分權值股範例)
+# 2. 定義掃描名單
 STOCK_LIST = [
     # 🟦 半導體 / AI 核心
     '2330','2317','2454','2308','2303','3711','3034','2379','2327','6531',
@@ -71,6 +71,35 @@ def safe_metric_text(val, fmt="{:.2f}", suffix=""):
         return "--"
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_stock_data(full_id, period):
+    """抓取股價資料，加入快取讓雲端穩一點"""
+    try:
+        data = yf.download(
+            full_id,
+            period=period,
+            progress=False,
+            auto_adjust=False,
+            threads=False
+        )
+        if data is None or data.empty:
+            return pd.DataFrame()
+        return clean_data(data)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def get_fundamental_info(full_id):
+    """抓取基本面 info，快取避免重複打 API"""
+    try:
+        ticker = yf.Ticker(full_id)
+        info = ticker.info if ticker.info else {}
+        return info
+    except Exception:
+        return {}
+
+
 def calc_fundamental_score(stock_id):
     """
     簡化版基本面分數
@@ -84,8 +113,7 @@ def calc_fundamental_score(stock_id):
     detail = []
 
     try:
-        ticker = yf.Ticker(full_id)
-        info = ticker.info if ticker.info else {}
+        info = get_fundamental_info(full_id)
 
         revenue_growth = safe_float(info.get("revenueGrowth"), default=np.nan)
         roe = safe_float(info.get("returnOnEquity"), default=np.nan)
@@ -163,39 +191,67 @@ def calc_fundamental_score(stock_id):
 
 
 def get_tech_signal(price, prev_close, ma5, ma20, vol, vma5):
-    """技術面簡化判讀"""
-    if any(pd.isna(x) for x in [price, prev_close, ma5, ma20, vol, vma5]) or vma5 == 0:
+    """技術面簡化判讀，放寬資料容錯"""
+    values = [price, prev_close, ma5, ma20, vol, vma5]
+    valid_count = sum(not pd.isna(x) for x in values)
+
+    if valid_count < 4:
         return {
             "trend": "資料不足",
             "message": "技術資料不足，暫時無法判讀",
             "level": "中性"
         }
 
-    if price > ma20:
-        if price > prev_close and vol > vma5 * 1.2:
+    # 優先使用價格與均線判斷主趨勢
+    if not pd.isna(price) and not pd.isna(ma20):
+        # 強：站上月線且 5MA > 20MA
+        if price > ma20 and (not pd.isna(ma5) and ma5 > ma20):
+            if (
+                not pd.isna(prev_close)
+                and not pd.isna(vol)
+                and not pd.isna(vma5)
+                and vma5 != 0
+                and price > prev_close
+                and vol > vma5 * 1.2
+            ):
+                return {
+                    "trend": "多頭",
+                    "message": "🚀 【量價齊揚】攻擊力道強，適合續抱或觀察強勢延續。",
+                    "level": "強"
+                }
+            elif abs(price - ma20) / ma20 < 0.02:
+                return {
+                    "trend": "多頭",
+                    "message": "🎯 【回測支撐】貼近月線，觀察量縮守穩買點。",
+                    "level": "中"
+                }
+            else:
+                return {
+                    "trend": "多頭",
+                    "message": "✅ 趨勢偏多，守住 5MA 可續觀察。",
+                    "level": "中"
+                }
+
+        # 中性：站上月線，但 5MA 還沒完全配合
+        if price > ma20:
             return {
-                "trend": "多頭",
-                "message": "🚀 【量價齊揚】攻擊力道強，適合續抱或觀察強勢延續。",
-                "level": "強"
-            }
-        elif abs(price - ma20) / ma20 < 0.015:
-            return {
-                "trend": "多頭",
-                "message": "🎯 【回測支撐】貼近月線，觀察量縮守穩買點。",
+                "trend": "中性偏多",
+                "message": "🟡 【月線之上】短線仍有撐，但動能尚待確認。",
                 "level": "中"
             }
-        else:
-            return {
-                "trend": "多頭",
-                "message": "✅ 趨勢偏多，守住 5MA 可續觀察。",
-                "level": "中"
-            }
-    else:
+
+        # 弱勢：跌破月線
         return {
             "trend": "弱勢",
             "message": "📉 【空頭格局】股價在月線下，建議保守觀望。",
             "level": "弱"
         }
+
+    return {
+        "trend": "資料不足",
+        "message": "技術資料不足，暫時無法判讀",
+        "level": "中性"
+    }
 
 
 def get_combined_advice(tech_signal, fund_result):
@@ -248,15 +304,13 @@ def render_message_box(message, box_type):
 if mode == "單股詳細診斷":
     st.sidebar.markdown("---")
     stock_id = st.sidebar.text_input("輸入台股代碼", value="2330")
-    period = st.sidebar.selectbox("觀測區間", ["3mo", "6mo", "1y"], index=0)
+    period = st.sidebar.selectbox("觀測區間", ["6mo", "3mo", "1y"], index=0)
 
     if stock_id:
         full_id = f"{stock_id}.TW"
-        data = yf.download(full_id, period=period, progress=False)
+        data = fetch_stock_data(full_id, period)
 
         if not data.empty:
-            data = clean_data(data)
-
             data['MA5'] = data['Close'].rolling(5).mean()
             data['MA20'] = data['Close'].rolling(20).mean()
             data['VMA5'] = data['Volume'].rolling(5).mean()
@@ -265,7 +319,7 @@ if mode == "單股詳細診斷":
                 st.warning("資料不足 20 日，建議擴大觀測區間。")
             else:
                 curr = data.iloc[-1]
-                prev = data.iloc[-2]
+                prev = data.iloc[-2] if len(data) >= 2 else data.iloc[-1]
 
                 price = safe_float(curr['Close'])
                 prev_close = safe_float(prev['Close'])
@@ -290,7 +344,11 @@ if mode == "單股詳細診斷":
                 # 頂部指標
                 c1, c2, c3, c4, c5 = st.columns(5)
                 c1.metric("最新股價", safe_metric_text(price))
-                c2.metric("短線趨勢", f"🔥 多頭" if tech_signal["trend"] == "多頭" else ("❄️ 弱勢" if tech_signal["trend"] == "弱勢" else "—"))
+                c2.metric(
+                    "短線趨勢",
+                    "🔥 多頭" if tech_signal["trend"] == "多頭"
+                    else ("❄️ 弱勢" if tech_signal["trend"] == "弱勢" else "🟡 中性")
+                )
                 c3.metric("成交量比", safe_metric_text(vol_ratio, "{:.2f}", "x"))
                 c4.metric("5MA 乖離", safe_metric_text(bias_5ma, "{:.1f}", "%"))
                 c5.metric("基本面評等", f"{fund_result['level']} ({fund_result['score']})")
@@ -301,7 +359,10 @@ if mode == "單股詳細診斷":
 
                 # 技術面說明
                 st.subheader("📉 技術面診斷")
-                render_message_box(tech_signal["message"], "info" if tech_signal["level"] != "弱" else "error")
+                render_message_box(
+                    tech_signal["message"],
+                    "info" if tech_signal["level"] in ["中", "中性"] else ("error" if tech_signal["level"] == "弱" else "success")
+                )
 
                 # 基本面說明
                 st.subheader("🏢 基本面簡評")
@@ -349,7 +410,7 @@ if mode == "單股詳細診斷":
                     row=1, col=1
                 )
 
-                # 台股常見習慣：紅漲綠跌
+                # 台股習慣：紅漲綠跌
                 bar_colors = [
                     'red' if data['Close'].iloc[i] >= data['Open'].iloc[i] else 'green'
                     for i in range(len(data))
@@ -374,14 +435,14 @@ if mode == "單股詳細診斷":
 
                 st.plotly_chart(fig, use_container_width=True)
         else:
-            st.error("查無資料，請確認代碼。")
+            st.error("查無資料，請確認代碼，或稍後再試。")
 
 
 # ---------- 模式二：全自動掃描器 ----------
 
 else:
     st.header("🎯 今日短線機會掃描")
-    st.write(f"正在監測：{', '.join(STOCK_LIST)} 等權值股")
+    st.write(f"正在監測：{len(STOCK_LIST)} 檔高活躍股票")
 
     if st.button("開始掃描市場（自動偵測回踩與轉強）"):
         results = []
@@ -389,10 +450,9 @@ else:
 
         for i, sid in enumerate(STOCK_LIST):
             try:
-                data = yf.download(f"{sid}.TW", period="1mo", progress=False)
+                data = fetch_stock_data(f"{sid}.TW", "3mo")
 
                 if not data.empty and len(data) >= 20:
-                    data = clean_data(data)
                     data['MA5'] = data['Close'].rolling(5).mean()
                     data['MA20'] = data['Close'].rolling(20).mean()
 
@@ -406,13 +466,19 @@ else:
                     pprev_ma5 = safe_float(pprev['MA5'])
                     ma20 = safe_float(curr['MA20'])
 
-                    if any(pd.isna(x) for x in [price, ma5, prev_ma5, pprev_ma5, ma20]):
+                    valid_count = sum(not pd.isna(x) for x in [price, ma5, prev_ma5, pprev_ma5, ma20])
+                    if valid_count < 4:
                         progress_bar.progress((i + 1) / len(STOCK_LIST))
                         continue
 
                     # 邏輯：回踩月線 或 5MA 轉強
-                    on_support = (abs(price - ma20) / ma20 < 0.015) and price >= ma20 if ma20 != 0 else False
-                    ma5_turn_up = (ma5 > prev_ma5) and (prev_ma5 <= pprev_ma5)
+                    on_support = False
+                    if not pd.isna(price) and not pd.isna(ma20) and ma20 != 0:
+                        on_support = (abs(price - ma20) / ma20 < 0.015) and price >= ma20
+
+                    ma5_turn_up = False
+                    if not pd.isna(ma5) and not pd.isna(prev_ma5) and not pd.isna(pprev_ma5):
+                        ma5_turn_up = (ma5 > prev_ma5) and (prev_ma5 <= pprev_ma5)
 
                     status = []
                     if on_support:
@@ -422,7 +488,7 @@ else:
 
                     if status:
                         fund_result = calc_fundamental_score(sid)
-                        bias_5ma = (price - ma5) / ma5 * 100 if ma5 != 0 else np.nan
+                        bias_5ma = (price - ma5) / ma5 * 100 if (not pd.isna(price) and not pd.isna(ma5) and ma5 != 0) else np.nan
 
                         if fund_result["score"] >= 70:
                             rating = "可觀察"
@@ -433,7 +499,7 @@ else:
 
                         results.append({
                             "代碼": sid,
-                            "價格": f"{price:.2f}",
+                            "價格": safe_metric_text(price),
                             "訊號": " + ".join(status),
                             "基本面": f'{fund_result["level"]} ({fund_result["score"]})',
                             "評價": rating,
